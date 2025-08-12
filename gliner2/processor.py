@@ -1,21 +1,15 @@
 import copy
 import random
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union, Iterator
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple, Iterator
+from typing import List
 
 import torch
 from transformers import AutoTokenizer
 
 
-class TokenSplitterBase():
-    def __init__(self):
-        pass
-
-    def __call__(self, text) -> (str, int, int):
-        pass
-
-
-class WhitespaceTokenSplitter(TokenSplitterBase):
+class WhitespaceTokenSplitter:
     """
     One‑pass tokenizer that treats…
       • URLs   → single token
@@ -26,9 +20,9 @@ class WhitespaceTokenSplitter(TokenSplitterBase):
     Yields (token, start, end) like nltk.tokenize.RegexTokenizer.
     """
 
-    __slots__ = ()                     # tiny memory footprint
+    __slots__ = ()  # tiny memory footprint
 
-    _PATTERN = re.compile(             # pre‑compiled once at import time
+    _PATTERN = re.compile(  # pre‑compiled once at import time
         r"""
         (?:https?://[^\s]+|            # URL with scheme
            www\.[^\s]+)                # or bare www.
@@ -45,7 +39,7 @@ class WhitespaceTokenSplitter(TokenSplitterBase):
     )
 
     def __call__(
-        self, text: str, lower: bool = True
+            self, text: str, lower: bool = True
     ) -> Iterator[Tuple[str, int, int]]:
         if lower:
             text = text.lower()
@@ -120,8 +114,22 @@ class SamplingConfig:
         self.max_num_labels = max_num_labels
 
 
+@dataclass
+class BatchProcessingResult:
+    """Container for batch processing results during training."""
+    token_embeddings: List[torch.Tensor]  # Per-sample token embeddings
+    embs_per_schema: List[List[List[torch.Tensor]]]  # [batch][schema][embeddings]
+    text_tokens: List[List[str]]
+    structure_labels: List[List[Any]]
+    task_types: List[List[str]]
+    original_records: List[Dict[str, Any]]
+    start_token_mappings: List[List[int]]  # Character position mappings
+    end_token_mappings: List[List[int]]  # Character position mappings
+
+
 class SchemaTransformer:
-    def __init__(self, model_name: str = None, tokenizer=None, sampling_config: SamplingConfig = None):
+    def __init__(self, model_name: str = None, tokenizer=None, sampling_config: SamplingConfig = None,
+                 token_pooling="first"):
         """
         Initialize the SchemaTransformer with a pretrained tokenizer and sampling configuration.
         If sampling_config is None, a default SamplingConfig is used.
@@ -130,9 +138,12 @@ class SchemaTransformer:
             model_name (str): Name or path of the model to load the tokenizer.
             tokenizer: An already loaded tokenizer (if provided, model_name is ignored).
             sampling_config (SamplingConfig): Custom sampling configuration for data augmentation.
+            token_pooling (str)
         """
         if model_name is None and tokenizer is None:
             raise ValueError("Either model_name or tokenizer must be provided.")
+
+        self.token_pooling = token_pooling if token_pooling in ["first", "mean", "max"] else "first"
 
         if tokenizer is not None:
             self.tokenizer = tokenizer
@@ -398,7 +409,7 @@ class SchemaTransformer:
                         seen.add(key)
 
                 # --- after you compute `uniq` (the deduped list of spans) ---
-                # if every cell in every span is empty ("" or None), treat as “no spans”
+                # if every cell in every span is empty ("" or None), treat as "no spans"
                 if all(all((cell is None) or (cell == "") for cell in span) for span in uniq):
                     count = 0
                     uniq = []
@@ -544,7 +555,7 @@ class SchemaTransformer:
                         new_descs[syn] = desc
                     label_descs = new_descs
 
-                    # Remap any few‐shot examples’ output labels
+                    # Remap any few‐shot examples' output labels
                     new_examples = []
                     for inp, out in examples:
                         if out in real2syn:
@@ -664,7 +675,7 @@ class SchemaTransformer:
                     return [f"[selection]{v}" for v in val]
                 return f"[selection]{val}"
 
-            # 1) Identify all “parent.field” names that are classifications
+            # 1) Identify all "parent.field" names that are classifications
             class_keys = {
                 f"{parent}.{fname}"
                 for struct in schema.get("json_structures", [])
@@ -682,7 +693,7 @@ class SchemaTransformer:
                             continue
 
                         fval = fields[fname]
-                        # if it’s a dict, pull out .value; otherwise use the raw field
+                        # if it's a dict, pull out .value; otherwise use the raw field
                         raw = fval["value"] if isinstance(fval, dict) else fval
                         fields[fname] = wrap(raw)
 
@@ -889,53 +900,89 @@ class SchemaTransformer:
             "subword_list": subword_list
         }
 
-    def extract_special_token_embeddings_per_schema(self, token_embeddings, input_ids, mapped_indices,
-                                                    num_hierarchical_schemas):
+    def extract_special_token_embeddings_per_schema(
+            self,
+            token_embeddings,
+            input_ids,
+            mapped_indices,
+            num_hierarchical_schemas: int,
+    ):
         """
-        Extract embeddings for special tokens [P], [C], [R], [L], [E] per hierarchical schema and
-        collect the first subword embedding for each text token (i.e., tokens after [SEP_TEXT]).
+        Extract embeddings for special tokens [P], [C], [R], [L], [E] per hierarchical
+        schema and aggregate sub-word pieces into word-level embeddings.
 
-        Args:
-            token_embeddings: Tensor of shape (batch_size, seq_len, hidden_size).
-            input_ids: Tensor of shape (batch_size, seq_len).
-            mapped_indices: List of tuples (seg_type, orig_idx, schema_idx) for each subword token.
-            num_hierarchical_schemas: Number of hierarchical schema segments.
-
-        Returns:
-            A dict with:
-             - "special_embeddings": A list of lists (length=num_hierarchical_schemas) where each inner list
-               contains embeddings (tensor slices) for special tokens in that schema.
-             - "text_embeddings": A list of embeddings corresponding to the first subword of each text token.
+        Parameters
+        ----------
+        token_embeddings : torch.Tensor  (1, seq_len, hidden)
+        input_ids        : torch.Tensor  (1, seq_len)
+        mapped_indices   : List[Tuple[str, int, int]]
+            (seg_type, orig_idx, schema_idx) for each sub-word.
+        num_hierarchical_schemas : int
+        Returns
+        -------
+        Dict[str, Any]
+            {
+              "embs_per_schema": List[List[torch.Tensor]],
+              "token_embeddings": torch.Tensor  (n_tokens, hidden)
+            }
         """
         input_ids_list = input_ids[0].tolist()
-        # Initialize list for schema special tokens embeddings.
-        collected_embeddings_per_schema = [[] for _ in range(num_hierarchical_schemas)]
-        text_embeddings = []
-        last_text_orig = None
 
-        special_tokens_set = {self.p_token, self.c_token, self.e_token, self.r_token, self.l_token}
+        # --- containers ----------------------------------------------------
+        special_sets = {self.p_token, self.c_token,
+                        self.e_token, self.r_token, self.l_token}
+        schema_embs = [[] for _ in range(num_hierarchical_schemas)]
+        word_embs: List[torch.Tensor] = []
 
-        # Iterate over each subword token in the sequence.
-        # token_embeddings assumed shape: (1, seq_len, hidden_size)
+        bucket: List[torch.Tensor] = []  # collect sub-pieces of current word
+        last_orig_idx = None
+
+        # --- iterate -------------------------------------------------------
         for i, tid in enumerate(input_ids_list):
             seg_type, orig_idx, schema_idx = mapped_indices[i]
-            # Get the embedding for this subword token.
-            embedding = token_embeddings[0, i, :]
+            emb = token_embeddings[0, i, :]
+
             if seg_type == "schema":
-                # Convert original token id to token string.
-                token_str = self.tokenizer.convert_ids_to_tokens(tid)
-                if token_str in special_tokens_set:
-                    collected_embeddings_per_schema[schema_idx].append(embedding)
+                tok = self.tokenizer.convert_ids_to_tokens(tid)
+                if tok in special_sets:
+                    schema_embs[schema_idx].append(emb)
+
             elif seg_type == "text":
-                # Only keep the first subword of a given text token.
-                if last_text_orig != orig_idx:
-                    text_embeddings.append(embedding)
-                    last_text_orig = orig_idx
+                # flush bucket when we reach a new original token
+                if last_orig_idx is not None and orig_idx != last_orig_idx and bucket:
+                    word_embs.append(self._aggregate_subtokens(bucket, self.token_pooling))
+                    bucket = []
+
+                bucket.append(emb)
+                last_orig_idx = orig_idx
+
+        # flush tail
+        if bucket:
+            word_embs.append(self._aggregate_subtokens(bucket, self.token_pooling))
 
         return {
-            "embs_per_schema": collected_embeddings_per_schema,
-            "token_embeddings": torch.stack(text_embeddings)
+            "embs_per_schema": schema_embs,
+            "token_embeddings": torch.stack(word_embs) if word_embs else torch.empty(0)
         }
+
+    # ----------------------------------------------------------------------
+    #  Helper – aggregation
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _aggregate_subtokens(pieces: List[torch.Tensor], pooling: str) -> torch.Tensor:
+        """
+        Aggregate a list of sub-word embeddings according to the pooling scheme.
+        """
+        if pooling == "first":
+            return pieces[0]
+        stack = torch.stack(pieces)
+        if pooling == "mean":
+            return stack.mean(dim=0)
+        if pooling == "max":
+            return stack.max(dim=0).values
+        if pooling == "first_last_sum":
+            return pieces[0] + pieces[-1]
+        raise ValueError(f"Unknown pooling='{pooling}'")
 
     def process_record(self, encoder, record: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -982,3 +1029,232 @@ class SchemaTransformer:
             "structure_labels": transformed["outputs"],
             **transformed
         }
+
+    # =====================================================
+    # BATCH PROCESSING METHODS
+    # =====================================================
+
+    def batch_process_records(self, encoder, records: List[Dict[str, Any]]) -> BatchProcessingResult:
+        """
+        Process multiple records in batch for training efficiency.
+
+        This method efficiently processes multiple records by:
+        1. Transforming all records
+        2. Batching encoder forward passes
+        3. Extracting embeddings for each sample
+
+        Parameters
+        ----------
+        encoder : torch.nn.Module
+            The encoder model
+        records : List[Dict[str, Any]]
+            List of records with 'text' and 'schema' keys
+
+        Returns
+        -------
+        BatchProcessingResult
+            Batched processing results containing embeddings and metadata
+        """
+        if not records:
+            # Handle empty batch gracefully
+            return BatchProcessingResult(
+                token_embeddings=[],
+                embs_per_schema=[],
+                text_tokens=[],
+                structure_labels=[],
+                task_types=[],
+                original_records=[],
+                start_token_mappings=[],
+                end_token_mappings=[]
+            )
+
+        # Transform all records first
+        transformed_records = []
+        for i, record in enumerate(records):
+            try:
+                transformed = self.transform_single_record(record)
+                transformed_records.append(transformed)
+            except Exception as e:
+                print(f"Warning: Failed to transform record {i}: {str(e)}")
+                # Create a minimal valid transformed record
+                transformed_records.append({
+                    "schema_tokens_list": [["(", "[P]", "dummy", "(", ")", ")"]],
+                    "text_tokens": ["."],
+                    "outputs": [[]],
+                    "task_types": ["entities"],
+                    "start_token_idx_to_text_idx": [0],
+                    "end_token_idx_to_text_idx": [1]
+                })
+
+        # Format inputs with mapping for all records
+        formatted_inputs = []
+        for i, transformed in enumerate(transformed_records):
+            try:
+                format_result = self.format_input_with_mapping(
+                    transformed["schema_tokens_list"],
+                    transformed["text_tokens"]
+                )
+                formatted_inputs.append(format_result)
+            except Exception as e:
+                print(f"Warning: Failed to format input for record {i}: {str(e)}")
+                # Skip this record
+                continue
+
+        if not formatted_inputs:
+            # All records failed to format
+            return BatchProcessingResult(
+                token_embeddings=[],
+                embs_per_schema=[],
+                text_tokens=[],
+                structure_labels=[],
+                task_types=[],
+                original_records=records,
+                start_token_mappings=[],
+                end_token_mappings=[]
+            )
+
+        # Prepare batch tensors
+        batch_input_ids, attention_mask, original_lengths = self._prepare_batch_tensors(formatted_inputs)
+
+        # Single forward pass through encoder
+        device = next(encoder.parameters()).device
+        batch_input_ids = batch_input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+
+        with torch.no_grad() if not self.is_training else torch.enable_grad():
+            outputs = encoder(input_ids=batch_input_ids, attention_mask=attention_mask)
+
+        # Extract embeddings for each sample
+        results = self._extract_batch_embeddings(
+            outputs.last_hidden_state,
+            batch_input_ids,
+            formatted_inputs,
+            transformed_records,
+            original_lengths,
+            records
+        )
+
+        return results
+
+    def _prepare_batch_tensors(self, formatted_inputs: List[Dict]) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+        """
+        Prepare padded batch tensors from formatted inputs.
+
+        Parameters
+        ----------
+        formatted_inputs : List[Dict]
+            List of formatted input dictionaries
+
+        Returns
+        -------
+        Tuple[torch.Tensor, torch.Tensor, List[int]]
+            - Padded input_ids tensor
+            - Attention mask tensor
+            - Original sequence lengths
+        """
+        if not formatted_inputs:
+            # Return empty tensors
+            return torch.zeros((0, 0), dtype=torch.long), torch.zeros((0, 0), dtype=torch.long), []
+
+        max_length = max(inp["inputs"]["input_ids"].shape[1] for inp in formatted_inputs)
+        batch_size = len(formatted_inputs)
+
+        # Initialize tensors
+        batch_input_ids = torch.zeros((batch_size, max_length), dtype=torch.long)
+        attention_mask = torch.zeros((batch_size, max_length), dtype=torch.long)
+        original_lengths = []
+
+        # Fill tensors
+        for i, inp in enumerate(formatted_inputs):
+            seq_len = inp["inputs"]["input_ids"].shape[1]
+            batch_input_ids[i, :seq_len] = inp["inputs"]["input_ids"][0]
+            attention_mask[i, :seq_len] = inp["inputs"]["attention_mask"][0]
+            original_lengths.append(seq_len)
+
+        return batch_input_ids, attention_mask, original_lengths
+
+    def _extract_batch_embeddings(
+            self,
+            batch_embeddings: torch.Tensor,
+            batch_input_ids: torch.Tensor,
+            formatted_inputs: List[Dict],
+            transformed_records: List[Dict],
+            original_lengths: List[int],
+            original_records: List[Dict[str, Any]]
+    ) -> BatchProcessingResult:
+        """
+        Extract embeddings for each sample in the batch.
+
+        Parameters
+        ----------
+        batch_embeddings : torch.Tensor
+            Embeddings from encoder output [batch_size, seq_len, hidden_size]
+        batch_input_ids : torch.Tensor
+            Input token IDs [batch_size, seq_len]
+        formatted_inputs : List[Dict]
+            List of formatted inputs with mapping info
+        transformed_records : List[Dict]
+            List of transformed records
+        original_lengths : List[int]
+            Original sequence lengths before padding
+        original_records : List[Dict[str, Any]]
+            Original input records
+
+        Returns
+        -------
+        BatchProcessingResult
+            Extracted embeddings and metadata for all samples
+        """
+        all_token_embeddings = []
+        all_embs_per_schema = []
+        all_text_tokens = []
+        all_structure_labels = []
+        all_task_types = []
+        all_start_mappings = []
+        all_end_mappings = []
+
+        # Process each sample
+        for i in range(len(formatted_inputs)):
+            if i >= len(original_lengths):
+                continue
+
+            seq_len = original_lengths[i]
+            token_embeddings = batch_embeddings[i, :seq_len, :]
+
+            # Extract special token embeddings
+            try:
+                emb_result = self.extract_special_token_embeddings_per_schema(
+                    token_embeddings.unsqueeze(0),
+                    batch_input_ids[i:i + 1, :seq_len],
+                    formatted_inputs[i]["mapped_indices"][:seq_len],
+                    num_hierarchical_schemas=len(transformed_records[i]["schema_tokens_list"])
+                )
+
+                all_token_embeddings.append(emb_result["token_embeddings"])
+                all_embs_per_schema.append(emb_result["embs_per_schema"])
+                all_text_tokens.append(transformed_records[i]["text_tokens"])
+                all_structure_labels.append(transformed_records[i]["outputs"])
+                all_task_types.append(transformed_records[i]["task_types"])
+                all_start_mappings.append(transformed_records[i].get("start_token_idx_to_text_idx", []))
+                all_end_mappings.append(transformed_records[i].get("end_token_idx_to_text_idx", []))
+            except Exception as e:
+                print(f"Warning: Failed to extract embeddings for sample {i}: {str(e)}")
+                # Add empty results for this sample
+                all_token_embeddings.append(torch.zeros(0, batch_embeddings.shape[2]))
+                all_embs_per_schema.append([])
+                all_text_tokens.append([])
+                all_structure_labels.append([])
+                all_task_types.append([])
+                all_start_mappings.append([])
+                all_end_mappings.append([])
+
+        return BatchProcessingResult(
+            token_embeddings=all_token_embeddings,
+            embs_per_schema=all_embs_per_schema,
+            text_tokens=all_text_tokens,
+            structure_labels=all_structure_labels,
+            task_types=all_task_types,
+            original_records=original_records,
+            start_token_mappings=all_start_mappings,
+            end_token_mappings=all_end_mappings
+        )

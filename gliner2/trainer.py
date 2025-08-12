@@ -2,9 +2,20 @@ import json
 import random
 from typing import Union, List
 
-import torch
+import transformers
 from torch.utils.data import Dataset
 from transformers import Trainer
+import torch
+
+# Import apex if available (for fp16 support)
+if transformers.utils.is_apex_available():
+    from apex import amp
+
+# Import sagemaker if available
+from transformers.trainer import is_sagemaker_mp_enabled
+
+if is_sagemaker_mp_enabled():
+    from transformers.trainer_pt_utils import smp_forward_backward
 
 
 class ExtractorDataset(Dataset):
@@ -53,15 +64,16 @@ class ExtractorTrainer(Trainer):
     """
     A Trainer with customized optimizer and training step tailored for the Extractor model.
     Now supports an option to freeze everything except `model.classifier`.
+    Includes FP16 support.
     """
 
     def __init__(
-        self,
-        encoder_lr,
-        custom_lr,
-        weight_decay,
-        finetune_classifier: bool = False,
-        **kwargs
+            self,
+            encoder_lr,
+            custom_lr,
+            weight_decay,
+            finetune_classifier: bool = False,
+            **kwargs
     ):
         """
         Args:
@@ -89,7 +101,6 @@ class ExtractorTrainer(Trainer):
         If finetune_classifier=True, only classifier params go into optimizer.
         Otherwise, use two groups: encoder and everything else.
         """
-        optimizer_grouped_parameters = []
 
         if self.finetune_classifier:
             # log
@@ -125,34 +136,76 @@ class ExtractorTrainer(Trainer):
 
         optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
-        return self.optimizer
 
-    def training_step(self, model, inputs, *args, **kwargs):
+    def compute_loss(self, model, inputs, return_outputs: bool = False, *args, **kwargs):
         """
-        Customized training step to process each record individually.
+        Compute the objective for a Hugging-Face Trainer batch **once** with
+        `model.process_records` instead of looping over `model.process_record`.
         """
+        # Ensure training-time behaviour (negative-span masking, dropout, etc.).
         model.train()
         model.processor.change_mode(is_training=True)
-        losses = []
+
+        # 1. Pack HF `inputs` -> List[{"text": str, "schema": dict}]
+        batch_records = [{"text": rec[0], "schema": rec[1]} for rec in inputs]
+
+        # 2. Forward pass in one call
+        batch_out = model.forward(
+            batch_records,
+            return_individual_losses=False
+        )
+
+        # 3. Derive the loss the Trainer expects
+        if batch_out["batch_size"] == 0:  # every sample failed – rare
+            device = next(model.parameters()).device
+            # Return a zero loss tensor that requires gradients
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
+        else:
+            # forward returns a **sum** over samples
+            loss = batch_out["total_loss"]
+        
+        return (loss, batch_out) if return_outputs else loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """
+        Perform a training step on a batch of inputs with FP16 support and CUDA OOM handling.
+
+        Args:
+            model: The model to train.
+            inputs: The inputs and targets of the model.
+            num_items_in_batch: Number of items in the batch (optional, for compatibility).
+        """
+        model.train()
+
         try:
-            # Each item in the batch is expected to be a tuple (input, output)
-            for record in inputs:
-                sample_record = {
-                    "text": record[0],
-                    "schema": record[1]
-                }
-                output = model.process_record(sample_record)
-                losses.append(output["loss"])
+            inputs = self._prepare_inputs(inputs)
 
-            if losses:
-                loss = torch.stack(losses).mean()
+            if is_sagemaker_mp_enabled():
+                loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+                return loss_mb.reduce_mean().detach().to(self.args.device)
+
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs)
+
+            del inputs
+            torch.cuda.empty_cache()
+
+            if self.args.n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+            if self.use_apex:
+                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                    scaled_loss.backward()
             else:
-                loss = torch.tensor(0.0, device=self.args.device, requires_grad=True)
-            loss.backward()
+                self.accelerator.backward(loss)
 
-            return loss.detach()
+            return loss.detach() / self.args.gradient_accumulation_steps
+
         except Exception as e:
             print(f"Skipping iteration due to error: {e}")
             model.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
-            return torch.tensor(0.0, requires_grad=True).to(model.device)
+            # Safely get device for DataParallel or normal model
+            _model = getattr(model, "module", model)
+            device = next(_model.parameters()).device
+            return torch.tensor(0.0, requires_grad=True, device=device)
