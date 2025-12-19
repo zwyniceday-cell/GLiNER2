@@ -883,65 +883,24 @@ class GLiNER2API:
         else:
             schema_dict = schema
         
-        # Determine task type based on schema contents
-        has_entities = "entities" in schema_dict
-        has_classifications = "classifications" in schema_dict
-        has_structures = "structures" in schema_dict
-        has_relations = "relations" in schema_dict
-        
-        # Use schema task for multi-task extraction
-        if sum([has_entities, has_classifications, has_structures, has_relations]) > 1:
-            return self._make_request(
-                task="schema",
-                text=text,
-                schema=schema_dict,
-                threshold=threshold,
-                include_confidence=include_confidence,
-                include_spans=include_spans,
-                format_results=format_results,
-            )
-        
-        # Single task - use specific endpoint or schema task
-        if has_entities:
-            return self.extract_entities(
-                text,
-                schema_dict["entities"],
-                threshold=threshold,
-                include_confidence=include_confidence,
-                include_spans=include_spans,
-                format_results=format_results,
-            )
-        elif has_classifications:
-            return self.classify_text(
-                text,
-                schema_dict["classifications"],
-                threshold=threshold,
-                include_confidence=include_confidence,
-                include_spans=include_spans,
-                format_results=format_results,
-            )
-        elif has_structures:
-            return self.extract_json(
-                text,
-                schema_dict["structures"],
-                threshold=threshold,
-                include_confidence=include_confidence,
-                include_spans=include_spans,
-                format_results=format_results,
-            )
-        elif has_relations:
-            # Relations use the schema task
-            return self._make_request(
-                task="schema",
-                text=text,
-                schema=schema_dict,
-                threshold=threshold,
-                include_confidence=include_confidence,
-                include_spans=include_spans,
-                format_results=format_results,
-            )
-        else:
+        # Validate schema has at least one extraction task
+        has_any_task = any(
+            key in schema_dict 
+            for key in ["entities", "classifications", "structures", "relations"]
+        )
+        if not has_any_task:
             raise ValueError("Schema must contain at least one extraction task")
+        
+        # Always use schema task to preserve all metadata (thresholds, dtypes, etc.)
+        return self._make_request(
+            task="schema",
+            text=text,
+            schema=schema_dict,
+            threshold=threshold,
+            include_confidence=include_confidence,
+            include_spans=include_spans,
+            format_results=format_results,
+        )
     
     def batch_extract(
         self,
