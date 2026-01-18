@@ -136,6 +136,30 @@ class Extractor(PreTrainedModel):
 
         self._print_config(config)
 
+    @classmethod
+    def init_from_base_model(
+            cls,
+            model_name: str,
+            encoder_overrides: Optional[Dict[str, Any]] = None,
+            **config_kwargs
+    ) -> "Extractor":
+        """
+        Initialize an Extractor with tokenizer + encoder config from a base model.
+
+        This builds the encoder from config (random init) and is useful for
+        lightweight pipeline checks or smaller-layer variants.
+        """
+        encoder_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        if encoder_overrides:
+            for key, value in encoder_overrides.items():
+                if not hasattr(encoder_config, key):
+                    raise ValueError(f"Unknown encoder config override: {key}")
+                setattr(encoder_config, key, value)
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        config = cls.config_class(model_name=model_name, **config_kwargs)
+        return cls(config, encoder_config=encoder_config, tokenizer=tokenizer)
+
     def _print_config(self, config):
         print("=" * 60)
         print("🧠 Model Configuration")
@@ -529,9 +553,9 @@ class Extractor(PreTrainedModel):
         config = cls.config_class.from_pretrained(config_path)
 
         encoder_config_path = download_or_local(repo_or_dir, "encoder_config/config.json")
-        encoder_config = AutoConfig.from_pretrained(encoder_config_path)
+        encoder_config = AutoConfig.from_pretrained(encoder_config_path, trust_remote_code=True)
 
-        tokenizer = AutoTokenizer.from_pretrained(repo_or_dir)
+        tokenizer = AutoTokenizer.from_pretrained(repo_or_dir, trust_remote_code=True)
         model = cls(config, encoder_config=encoder_config, tokenizer=tokenizer)
 
         # Load weights

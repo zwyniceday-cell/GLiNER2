@@ -200,7 +200,15 @@ class SchemaTransformer:
             raise ValueError("Either model_name or tokenizer must be provided.")
 
         self.token_pooling = token_pooling if token_pooling in ["first", "mean", "max"] else "first"
-        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True
+        )
+        if self.tokenizer.padding_side != "right":
+            self.tokenizer.padding_side = "right"
+        if self.tokenizer.pad_token is None:
+            if self.tokenizer.eos_token is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
         self.word_splitter = WhitespaceTokenSplitter()
         self.sampling_config = sampling_config or SamplingConfig()
         self.is_training = False
@@ -379,9 +387,10 @@ class SchemaTransformer:
 
         max_len = max(len(r.input_ids) for r in records)
         batch_size = len(records)
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
 
         # Pre-allocate tensors
-        input_ids = torch.zeros((batch_size, max_len), dtype=torch.long)
+        input_ids = torch.full((batch_size, max_len), pad_id, dtype=torch.long)
         attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long)
         original_lengths = []
 
